@@ -5,7 +5,7 @@ django-cors-headers==4.3.1
 celery==5.3.6
 redis==5.0.1
 parth-dl==1.0.1
-yt-dlp==2024.3.10
+yt-dlp==2025.12.21
 requests==2.31.0
 python-decouple==3.8
 gunicorn==21.2.0
