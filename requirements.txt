@@ -1,0 +1,15 @@
+# Django Backend for Reel Downloader
+Django==5.0.3
+djangorestframework==3.14.0
+django-cors-headers==4.3.1
+celery==5.3.6
+redis==5.0.1
+parth-dl==1.0.1
+yt-dlp==2024.3.10
+requests==2.31.0
+python-decouple==3.8
+gunicorn==21.2.0
+whitenoise==6.6.0
+psycopg2-binary==2.9.9
+django-storages==1.14.2
+boto3==1.34.51
