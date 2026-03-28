@@ -13,9 +13,12 @@ RUN apt-get update && apt-get install -y \
     postgresql-client \
     && rm -rf /var/lib/apt/lists/*
 
-# Install Python dependencies
+# Install Python dependencies (force fresh install, no cache)
 COPY requirements.txt .
-RUN pip install --upgrade pip && pip install -r requirements.txt
+RUN pip install --upgrade pip && pip install --no-cache-dir -r requirements.txt
+
+# Force yt-dlp to latest version
+RUN pip install --no-cache-dir --upgrade yt-dlp
 
 # Copy project
 COPY . .
