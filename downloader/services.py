@@ -16,6 +16,30 @@ from django.conf import settings
 logger = logging.getLogger(__name__)
 
 
+def get_instagram_cookies_path():
+    """
+    Get the path to Instagram cookies file.
+    Checks INSTAGRAM_COOKIES_PATH env var first, then defaults to MEDIA_ROOT/instagram_cookies.txt
+
+    Returns:
+        Path to cookies file or None if not configured
+    """
+    # Check environment variable first
+    env_path = os.environ.get('INSTAGRAM_COOKIES_PATH')
+    if env_path and os.path.exists(env_path):
+        logger.info(f"Using Instagram cookies from environment: {env_path}")
+        return env_path
+
+    # Default to MEDIA_ROOT/instagram_cookies.txt
+    default_path = settings.MEDIA_ROOT / 'instagram_cookies.txt'
+    if default_path.exists():
+        logger.info(f"Using Instagram cookies from default location: {default_path}")
+        return str(default_path)
+
+    logger.info("No Instagram cookies file found - will try unauthenticated extraction")
+    return None
+
+
 def detect_platform(url):
     """Detect platform from URL"""
     if 'instagram.com' in url:
@@ -216,11 +240,22 @@ def download_instagram_video(url, download_to_server=False):
     }
 
 
-def _download_instagram_with_ytdlp(url, download_to_server=False):
+def _download_instagram_with_ytdlp(url, download_to_server=False, use_cookies=False):
     """
     Fallback Instagram extraction using yt-dlp
-    Note: yt-dlp may require cookies for Instagram, but we try without first
+    First tries without authentication, then with cookies if available and needed
+
+    Args:
+        url: Instagram URL
+        download_to_server: Whether to download to server
+        use_cookies: If True, use cookies; if False, try without first then fallback to cookies
+
+    Returns:
+        dict with success status and download info
     """
+    cookies_path = get_instagram_cookies_path()
+    cookies_opts = {'cookiefile': cookies_path} if cookies_path else {}
+
     try:
         import yt_dlp
 
@@ -228,9 +263,10 @@ def _download_instagram_with_ytdlp(url, download_to_server=False):
         match = re.search(r'(?:reel|p)/([A-Za-z0-9_-]+)', url)
         shortcode = match.group(1) if match else 'unknown'
 
-        logger.info(f"Trying Instagram extraction via yt-dlp: {shortcode}")
+        cookie_status = "with cookies" if cookies_path else "without cookies"
+        logger.info(f"Trying Instagram extraction via yt-dlp {cookie_status}: {shortcode}")
 
-        # yt-dlp options - try without authentication first
+        # yt-dlp options - base configuration
         ydl_opts = {
             'format': 'best[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
             'quiet': True,
@@ -243,6 +279,9 @@ def _download_instagram_with_ytdlp(url, download_to_server=False):
             # Use a realistic user agent
             'user_agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1',
         }
+
+        # Add cookies if available and requested
+        ydl_opts.update(cookies_opts)
 
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=False)
@@ -262,6 +301,11 @@ def _download_instagram_with_ytdlp(url, download_to_server=False):
                     video_url = best_format.get('url')
 
             if not video_url:
+                # If failed with cookies and we haven't tried with cookies, or vice versa
+                if not use_cookies and cookies_path:
+                    # First attempt failed without cookies, try with cookies
+                    logger.info("Unauthenticated extraction failed, retrying with cookies...")
+                    return _download_instagram_with_ytdlp(url, download_to_server, use_cookies=True)
                 return {
                     'success': False,
                     'error': 'yt-dlp could not extract video URL - may require authentication'
@@ -285,6 +329,7 @@ def _download_instagram_with_ytdlp(url, download_to_server=False):
             if download_to_server:
                 return download_video_to_server(video_url, shortcode, 'instagram')
             else:
+                auth_note = " (authenticated)" if use_cookies or cookies_path else ""
                 return {
                     'success': True,
                     'download_url': video_url,
@@ -294,14 +339,21 @@ def _download_instagram_with_ytdlp(url, download_to_server=False):
                     'quality': quality,
                     'resolution': f"{width}x{height}",
                     'duration': duration,
-                    'message': f'Best quality ({quality}) via yt-dlp fallback'
+                    'message': f'Best quality ({quality}) via yt-dlp{auth_note}'
                 }
 
     except Exception as e:
-        logger.error(f"yt-dlp Instagram fallback failed: {str(e)}")
+        error_str = str(e)
+        logger.error(f"yt-dlp Instagram extraction failed: {error_str}")
+
+        # If failed without cookies and cookies are available, try with cookies
+        if not use_cookies and cookies_path:
+            logger.info("Extraction failed without cookies, retrying with cookies...")
+            return _download_instagram_with_ytdlp(url, download_to_server, use_cookies=True)
+
         return {
             'success': False,
-            'error': f'yt-dlp fallback failed: {str(e)}'
+            'error': f'yt-dlp extraction failed: {error_str}'
         }
 
 
