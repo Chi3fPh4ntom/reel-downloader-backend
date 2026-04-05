@@ -40,6 +40,87 @@ def get_instagram_cookies_path():
     return None
 
 
+def get_proxy_list():
+    """
+    Get list of proxies for Instagram extraction.
+    Loads from:
+    - INSTAGRAM_PROXIES environment variable (comma-separated list)
+    - proxies.txt file in project root
+
+    Supported formats:
+    - http://user:pass@ip:port
+    - https://ip:port
+    - ip:port (defaults to http)
+
+    Returns:
+        List of proxy URLs or empty list if none configured
+    """
+    proxies = []
+
+    # Try environment variable first
+    env_proxies = os.environ.get('INSTAGRAM_PROXIES')
+    if env_proxies:
+        logger.info("Loading proxies from INSTAGRAM_PROXIES environment variable")
+        for proxy in env_proxies.split(','):
+            proxy = proxy.strip()
+            if proxy:
+                # Normalize proxy format
+                normalized = normalize_proxy(proxy)
+                if normalized:
+                    proxies.append(normalized)
+        logger.info(f"Loaded {len(proxies)} proxies from environment")
+
+    # Fall back to proxies.txt file if no env proxies
+    if not proxies:
+        project_root = Path(__file__).parent.parent
+        proxies_file = project_root / 'proxies.txt'
+        if proxies_file.exists():
+            logger.info(f"Loading proxies from {proxies_file}")
+            with open(proxies_file, 'r') as f:
+                for line in f:
+                    proxy = line.strip()
+                    if proxy and not proxy.startswith('#'):
+                        normalized = normalize_proxy(proxy)
+                        if normalized:
+                            proxies.append(normalized)
+            logger.info(f"Loaded {len(proxies)} proxies from file")
+
+    if proxies:
+        logger.info(f"Proxy support enabled with {len(proxies)} proxies")
+    else:
+        logger.info("No proxies configured - will try direct connection")
+
+    return proxies
+
+
+def normalize_proxy(proxy):
+    """
+    Normalize proxy format to ensure consistent http:// or https:// prefix.
+
+    Args:
+        proxy: Raw proxy string in various formats
+
+    Returns:
+        Normalized proxy URL or None if invalid
+    """
+    if not proxy:
+        return None
+
+    proxy = proxy.strip()
+
+    # Already has protocol
+    if proxy.startswith('http://') or proxy.startswith('https://'):
+        return proxy
+
+    # IP:port format - assume HTTP
+    if ':' in proxy:
+        return f"http://{proxy}"
+
+    # Invalid format
+    logger.warning(f"Invalid proxy format: {proxy}")
+    return None
+
+
 def detect_platform(url):
     """Detect platform from URL"""
     if 'instagram.com' in url:
@@ -79,6 +160,7 @@ def download_instagram_video(url, download_to_server=False):
     """
     Download Instagram video using parth-dl (no login required) with yt-dlp fallback
     Always returns best quality URL
+    Supports proxy rotation to bypass IP blocking
 
     Args:
         url: Instagram reel/post URL
@@ -90,6 +172,9 @@ def download_instagram_video(url, download_to_server=False):
     """
     max_retries = 3
     retry_delay = 2  # seconds
+
+    # Load proxy list for IP blocking bypass
+    proxy_list = get_proxy_list()
 
     for attempt in range(max_retries):
         try:
@@ -198,7 +283,7 @@ def download_instagram_video(url, download_to_server=False):
 
                 # Try yt-dlp as fallback before giving up
                 logger.info("Trying yt-dlp as fallback for Instagram...")
-                yt_result = _download_instagram_with_ytdlp(url, download_to_server)
+                yt_result = _download_instagram_with_ytdlp(url, download_to_server, proxy_list=proxy_list)
                 if yt_result.get('success'):
                     return yt_result
 
@@ -209,7 +294,7 @@ def download_instagram_video(url, download_to_server=False):
 
         except ImportError:
             logger.error("parth-dl not installed, trying yt-dlp...")
-            yt_result = _download_instagram_with_ytdlp(url, download_to_server)
+            yt_result = _download_instagram_with_ytdlp(url, download_to_server, proxy_list=proxy_list)
             if yt_result.get('success'):
                 return yt_result
             return {
@@ -230,25 +315,36 @@ def download_instagram_video(url, download_to_server=False):
 
     # If we exhausted all retries, try yt-dlp as last resort
     logger.info("All parth-dl attempts exhausted, trying yt-dlp as last resort...")
-    yt_result = _download_instagram_with_ytdlp(url, download_to_server)
+    yt_result = _download_instagram_with_ytdlp(url, download_to_server, proxy_list=proxy_list)
     if yt_result.get('success'):
         return yt_result
 
+    # If proxies are available and we still failed, try proxy rotation as final attempt
+    if proxy_list:
+        logger.info(f"Trying proxy rotation with {len(proxy_list)} proxies as final attempt...")
+        proxy_result = _try_with_proxy_rotation(url, download_to_server, False, proxy_list)
+        if proxy_result.get('success'):
+            return proxy_result
+        logger.warning("Proxy rotation also failed")
+
     return {
         'success': False,
-        'error': 'All extraction methods failed. Instagram may be rate-limiting this IP or the video may be unavailable.'
+        'error': 'All extraction methods failed. Instagram may be rate-limiting this IP or the video may be unavailable. Consider using proxies to bypass IP blocking.'
     }
 
 
-def _download_instagram_with_ytdlp(url, download_to_server=False, use_cookies=False):
+def _download_instagram_with_ytdlp(url, download_to_server=False, use_cookies=False, proxy=None, proxy_list=None):
     """
     Fallback Instagram extraction using yt-dlp
     First tries without authentication, then with cookies if available and needed
+    Supports proxy rotation for IP blocking bypass
 
     Args:
         url: Instagram URL
         download_to_server: Whether to download to server
         use_cookies: If True, use cookies; if False, try without first then fallback to cookies
+        proxy: Specific proxy URL to use (overrides rotation)
+        proxy_list: List of proxies to rotate through on failures
 
     Returns:
         dict with success status and download info
@@ -264,7 +360,8 @@ def _download_instagram_with_ytdlp(url, download_to_server=False, use_cookies=Fa
         shortcode = match.group(1) if match else 'unknown'
 
         cookie_status = "with cookies" if cookies_path else "without cookies"
-        logger.info(f"Trying Instagram extraction via yt-dlp {cookie_status}: {shortcode}")
+        proxy_status = f" via proxy {proxy}" if proxy else "without proxy"
+        logger.info(f"Trying Instagram extraction via yt-dlp {cookie_status} {proxy_status}: {shortcode}")
 
         # yt-dlp options - base configuration
         ydl_opts = {
@@ -279,6 +376,11 @@ def _download_instagram_with_ytdlp(url, download_to_server=False, use_cookies=Fa
             # Use a realistic user agent
             'user_agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1',
         }
+
+        # Add proxy if provided
+        if proxy:
+            ydl_opts['proxy'] = proxy
+            logger.info(f"Using proxy: {proxy}")
 
         # Add cookies if available and requested
         ydl_opts.update(cookies_opts)
@@ -305,7 +407,7 @@ def _download_instagram_with_ytdlp(url, download_to_server=False, use_cookies=Fa
                 if not use_cookies and cookies_path:
                     # First attempt failed without cookies, try with cookies
                     logger.info("Unauthenticated extraction failed, retrying with cookies...")
-                    return _download_instagram_with_ytdlp(url, download_to_server, use_cookies=True)
+                    return _download_instagram_with_ytdlp(url, download_to_server, use_cookies=True, proxy=proxy, proxy_list=proxy_list)
                 return {
                     'success': False,
                     'error': 'yt-dlp could not extract video URL - may require authentication'
@@ -330,6 +432,7 @@ def _download_instagram_with_ytdlp(url, download_to_server=False, use_cookies=Fa
                 return download_video_to_server(video_url, shortcode, 'instagram')
             else:
                 auth_note = " (authenticated)" if use_cookies or cookies_path else ""
+                proxy_note = f" via {proxy}" if proxy else ""
                 return {
                     'success': True,
                     'download_url': video_url,
@@ -339,22 +442,83 @@ def _download_instagram_with_ytdlp(url, download_to_server=False, use_cookies=Fa
                     'quality': quality,
                     'resolution': f"{width}x{height}",
                     'duration': duration,
-                    'message': f'Best quality ({quality}) via yt-dlp{auth_note}'
+                    'message': f'Best quality ({quality}) via yt-dlp{auth_note}{proxy_note}'
                 }
 
     except Exception as e:
         error_str = str(e)
         logger.error(f"yt-dlp Instagram extraction failed: {error_str}")
 
+        # Check if this is a proxy-related error that should trigger rotation
+        is_proxy_error = any(x in error_str.lower() for x in ['proxy', 'connection', 'timeout', 'timed out', 'blocked'])
+
+        # If we have a proxy list and got a proxy-related error, try rotating
+        if proxy_list and is_proxy_error and proxy is None:
+            logger.warning("Proxy-related error detected, trying with proxy rotation...")
+            return _try_with_proxy_rotation(url, download_to_server, use_cookies, proxy_list)
+
         # If failed without cookies and cookies are available, try with cookies
         if not use_cookies and cookies_path:
             logger.info("Extraction failed without cookies, retrying with cookies...")
-            return _download_instagram_with_ytdlp(url, download_to_server, use_cookies=True)
+            return _download_instagram_with_ytdlp(url, download_to_server, use_cookies=True, proxy=proxy, proxy_list=proxy_list)
 
         return {
             'success': False,
             'error': f'yt-dlp extraction failed: {error_str}'
         }
+
+
+def _try_with_proxy_rotation(url, download_to_server, use_cookies, proxy_list):
+    """
+    Try downloading with rotating proxies from the list.
+
+    Args:
+        url: Instagram URL
+        download_to_server: Whether to download to server
+        use_cookies: Whether to use cookies
+        proxy_list: List of proxy URLs to try
+
+    Returns:
+        dict with success status and download info
+    """
+    if not proxy_list:
+        return {
+            'success': False,
+            'error': 'No proxies available for rotation'
+        }
+
+    logger.info(f"Trying {len(proxy_list)} proxies in rotation...")
+
+    for i, proxy in enumerate(proxy_list):
+        logger.info(f"Trying proxy {i + 1}/{len(proxy_list)}: {proxy}")
+        try:
+            result = _download_instagram_with_ytdlp(
+                url,
+                download_to_server=download_to_server,
+                use_cookies=use_cookies,
+                proxy=proxy,
+                proxy_list=proxy_list
+            )
+            if result.get('success'):
+                logger.info(f"Successfully downloaded using proxy: {proxy}")
+                return result
+            else:
+                error = result.get('error', 'Unknown error')
+                # Check if error suggests trying next proxy
+                should_continue = any(x in error.lower() for x in ['proxy', 'connection', 'timeout', 'blocked', 'rate', 'temporarily'])
+                if not should_continue:
+                    # Non-proxy error, don't bother trying other proxies
+                    logger.error(f"Non-proxy error: {error}")
+                    return result
+                logger.warning(f"Proxy {proxy} failed: {error}, trying next...")
+        except Exception as e:
+            logger.warning(f"Proxy {proxy} exception: {str(e)}, trying next...")
+            continue
+
+    return {
+        'success': False,
+        'error': f'All {len(proxy_list)} proxies failed'
+    }
 
 
 def download_facebook_video(url, download_to_server=False):
