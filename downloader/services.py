@@ -1,7 +1,7 @@
 """
 Video Download Services
 Handles Instagram and Facebook video downloading
-Uses parth-dl for Instagram (no login required)
+Uses parth-dl for Instagram (no login required) with yt-dlp fallback
 Returns best quality direct download URLs
 """
 import os
@@ -9,6 +9,7 @@ import re
 import uuid
 import logging
 import shutil
+import time
 from pathlib import Path
 from django.conf import settings
 
@@ -52,65 +53,226 @@ def select_best_quality_format(formats):
 
 def download_instagram_video(url, download_to_server=False):
     """
-    Download Instagram video using parth-dl (no login required)
+    Download Instagram video using parth-dl (no login required) with yt-dlp fallback
     Always returns best quality URL
-    
+
     Args:
         url: Instagram reel/post URL
         download_to_server: If True, download file to server and return server URL
                            If False, extract direct URL and return Instagram CDN URL
-    
+
     Returns:
         dict with success status and download_url
     """
+    max_retries = 3
+    retry_delay = 2  # seconds
+
+    for attempt in range(max_retries):
+        try:
+            from parth_dl import InstagramDownloader
+
+            # Extract shortcode for filename
+            match = re.search(r'(?:reel|p)/([A-Za-z0-9_-]+)', url)
+            shortcode = match.group(1) if match else 'unknown'
+
+            logger.info(f"Processing Instagram reel: {shortcode} (attempt {attempt + 1}/{max_retries})")
+
+            # Initialize downloader with rate limiting disabled for faster retries
+            dl = InstagramDownloader(verbose=False, rate_limit=False)
+
+            try:
+                # Get video info
+                info = dl.get_info(url)
+
+                if not info:
+                    if attempt < max_retries - 1:
+                        logger.warning(f"parth-dl returned empty info, retrying in {retry_delay}s...")
+                        time.sleep(retry_delay)
+                        retry_delay *= 2  # Exponential backoff
+                        continue
+                    return {
+                        'success': False,
+                        'error': 'Could not extract video information after multiple attempts'
+                    }
+
+                # Extract formats and select best quality
+                formats = info.get('formats', [])
+
+                if not formats:
+                    if attempt < max_retries - 1:
+                        logger.warning(f"parth-dl returned no formats, retrying in {retry_delay}s...")
+                        time.sleep(retry_delay)
+                        retry_delay *= 2
+                        continue
+                    return {
+                        'success': False,
+                        'error': 'No video formats available'
+                    }
+
+                # Select best quality format
+                best_format = select_best_quality_format(formats)
+                video_url = best_format.get('url')
+
+                if not video_url:
+                    if attempt < max_retries - 1:
+                        logger.warning(f"parth-dl returned no video URL, retrying in {retry_delay}s...")
+                        time.sleep(retry_delay)
+                        retry_delay *= 2
+                        continue
+                    return {
+                        'success': False,
+                        'error': 'Could not extract video URL'
+                    }
+
+                # Get video metadata
+                width = best_format.get('width', 0)
+                height = best_format.get('height', 0)
+                has_audio = best_format.get('has_audio', False)
+                duration = info.get('duration', 0)
+
+                # Determine quality label
+                if height >= 1920:
+                    quality = '1080p'
+                elif height >= 1280:
+                    quality = '720p'
+                elif height >= 720:
+                    quality = '480p'
+                else:
+                    quality = '360p'
+
+                if download_to_server:
+                    # Download to server
+                    return download_video_to_server(video_url, shortcode, 'instagram')
+                else:
+                    # Return direct URL with metadata
+                    return {
+                        'success': True,
+                        'download_url': video_url,
+                        'filename': f"instagram_{shortcode}.mp4",
+                        'platform': 'instagram',
+                        'direct_url': True,
+                        'quality': quality,
+                        'resolution': f"{width}x{height}",
+                        'has_audio': has_audio,
+                        'duration': duration,
+                        'file_size_estimate': None,  # Can't know without downloading
+                        'message': f'Best quality ({quality}) direct download URL from Instagram CDN'
+                    }
+
+            except Exception as e:
+                error_str = str(e)
+                logger.warning(f"parth-dl extraction error (attempt {attempt + 1}): {error_str}")
+
+                # Check if this is a rate limiting or network error
+                is_retryable = any(x in error_str.lower() for x in ['rate', 'timeout', 'connection', 'network', 'temporarily'])
+
+                if attempt < max_retries - 1 and is_retryable:
+                    logger.warning(f"Retryable error, waiting {retry_delay}s before retry...")
+                    time.sleep(retry_delay)
+                    retry_delay *= 2
+                    continue
+
+                # Try yt-dlp as fallback before giving up
+                logger.info("Trying yt-dlp as fallback for Instagram...")
+                yt_result = _download_instagram_with_ytdlp(url, download_to_server)
+                if yt_result.get('success'):
+                    return yt_result
+
+                return {
+                    'success': False,
+                    'error': f'Extraction failed: {error_str}'
+                }
+
+        except ImportError:
+            logger.error("parth-dl not installed, trying yt-dlp...")
+            yt_result = _download_instagram_with_ytdlp(url, download_to_server)
+            if yt_result.get('success'):
+                return yt_result
+            return {
+                'success': False,
+                'error': 'parth-dl library not installed and yt-dlp fallback failed'
+            }
+        except Exception as e:
+            logger.error(f"Instagram download error (attempt {attempt + 1}): {str(e)}")
+            if attempt < max_retries - 1:
+                logger.warning(f"Retrying in {retry_delay}s...")
+                time.sleep(retry_delay)
+                retry_delay *= 2
+                continue
+            return {
+                'success': False,
+                'error': f'Instagram download failed: {str(e)}'
+            }
+
+    # If we exhausted all retries, try yt-dlp as last resort
+    logger.info("All parth-dl attempts exhausted, trying yt-dlp as last resort...")
+    yt_result = _download_instagram_with_ytdlp(url, download_to_server)
+    if yt_result.get('success'):
+        return yt_result
+
+    return {
+        'success': False,
+        'error': 'All extraction methods failed. Instagram may be rate-limiting this IP or the video may be unavailable.'
+    }
+
+
+def _download_instagram_with_ytdlp(url, download_to_server=False):
+    """
+    Fallback Instagram extraction using yt-dlp
+    Note: yt-dlp may require cookies for Instagram, but we try without first
+    """
     try:
-        from parth_dl import InstagramDownloader
-        
+        import yt_dlp
+
         # Extract shortcode for filename
         match = re.search(r'(?:reel|p)/([A-Za-z0-9_-]+)', url)
         shortcode = match.group(1) if match else 'unknown'
-        
-        logger.info(f"Processing Instagram reel: {shortcode}")
-        
-        # Initialize downloader
-        dl = InstagramDownloader(verbose=False)
-        
-        try:
-            # Get video info
-            info = dl.get_info(url)
-            
+
+        logger.info(f"Trying Instagram extraction via yt-dlp: {shortcode}")
+
+        # yt-dlp options - try without authentication first
+        ydl_opts = {
+            'format': 'best[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
+            'quiet': True,
+            'no_warnings': True,
+            'no_download': True,
+            'extract_flat': False,
+            'retries': 3,
+            'ignoreerrors': False,
+            'no_check_certificate': True,
+            # Use a realistic user agent
+            'user_agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1',
+        }
+
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+
             if not info:
                 return {
                     'success': False,
-                    'error': 'Could not extract video information'
+                    'error': 'yt-dlp could not extract video information'
                 }
-            
-            # Extract formats and select best quality
-            formats = info.get('formats', [])
-            
-            if not formats:
-                return {
-                    'success': False,
-                    'error': 'No video formats available'
-                }
-            
-            # Select best quality format
-            best_format = select_best_quality_format(formats)
-            video_url = best_format.get('url')
-            
+
+            video_url = info.get('url')
+            if not video_url:
+                # Try to get from formats
+                formats = info.get('formats', [])
+                if formats:
+                    best_format = max(formats, key=lambda x: x.get('height', 0) * x.get('width', 0))
+                    video_url = best_format.get('url')
+
             if not video_url:
                 return {
                     'success': False,
-                    'error': 'Could not extract video URL'
+                    'error': 'yt-dlp could not extract video URL - may require authentication'
                 }
-            
-            # Get video metadata
-            width = best_format.get('width', 0)
-            height = best_format.get('height', 0)
-            has_audio = best_format.get('has_audio', False)
+
+            width = info.get('width', 0)
+            height = info.get('height', 0)
             duration = info.get('duration', 0)
-            
-            # Determine quality label
+            title = info.get('title', shortcode)
+
+            # Determine quality
             if height >= 1920:
                 quality = '1080p'
             elif height >= 1280:
@@ -119,12 +281,10 @@ def download_instagram_video(url, download_to_server=False):
                 quality = '480p'
             else:
                 quality = '360p'
-            
+
             if download_to_server:
-                # Download to server
                 return download_video_to_server(video_url, shortcode, 'instagram')
             else:
-                # Return direct URL with metadata
                 return {
                     'success': True,
                     'download_url': video_url,
@@ -133,30 +293,15 @@ def download_instagram_video(url, download_to_server=False):
                     'direct_url': True,
                     'quality': quality,
                     'resolution': f"{width}x{height}",
-                    'has_audio': has_audio,
                     'duration': duration,
-                    'file_size_estimate': None,  # Can't know without downloading
-                    'message': f'Best quality ({quality}) direct download URL from Instagram CDN'
+                    'message': f'Best quality ({quality}) via yt-dlp fallback'
                 }
-            
-        except Exception as e:
-            logger.error(f"parth-dl extraction error: {str(e)}")
-            return {
-                'success': False,
-                'error': f'Extraction failed: {str(e)}'
-            }
-            
-    except ImportError:
-        logger.error("parth-dl not installed")
-        return {
-            'success': False,
-            'error': 'parth-dl library not installed'
-        }
+
     except Exception as e:
-        logger.error(f"Instagram download error: {str(e)}")
+        logger.error(f"yt-dlp Instagram fallback failed: {str(e)}")
         return {
             'success': False,
-            'error': f'Instagram download failed: {str(e)}'
+            'error': f'yt-dlp fallback failed: {str(e)}'
         }
 
 
